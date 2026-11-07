@@ -1,34 +1,50 @@
 name: HMT stock check
 
 on:
+  workflow_dispatch:           # "Run workflow" button + the external trigger (cron-job.org)
+    inputs:
+      debug:
+        description: "Save the rendered pages as a downloadable artifact"
+        type: boolean
+        default: false
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (GitHub's minimum)
-  workflow_dispatch:         # lets you run it manually from the Actions tab
+    - cron: "7,37 * * * *"     # backup only: GitHub's own schedule is unreliable
 
 permissions:
-  contents: write            # needed to save state.json back to the repo
+  contents: write              # lets the job save state.json back to the repo
 
 concurrency:
   group: hmt-check
-  cancel-in-progress: false  # never run two checks at once
+  cancel-in-progress: false    # never run two checks at once
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - run: pip install -r requirements.txt
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - run: python -m playwright install --with-deps chromium
 
       - name: Run tracker
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SOURCE_URLS: ${{ vars.SOURCE_URLS }}
+          DEBUG: ${{ github.event.inputs.debug }}
         run: python hmt_bot.py
 
       - name: Save state
@@ -37,3 +53,12 @@ jobs:
           git config user.email "hmt-bot@users.noreply.github.com"
           git add state.json
           git diff --cached --quiet || (git commit -m "update state" && git push)
+
+      - name: Upload rendered pages (only exists on problems or debug runs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-pages
+          path: debug/
+          retention-days: 1
+          if-no-files-found: ignore
