@@ -12,6 +12,7 @@ Telegram commands:
     /track all         track everything listed
     /list              show tracked watches + last known status
     /untrack 2         stop tracking number 2 from /list (or "all")
+    /why 12            show the tile text the bot read for watch 12
     /status            what the bot saw on its latest check
 """
 import json
@@ -32,7 +33,7 @@ DEFAULT_SOURCES = "https://www.hmtwatches.in/,https://hmtwatches.in/mens"
 SOURCES = [u.strip() for u in (os.getenv("SOURCE_URLS") or DEFAULT_SOURCES).split(",") if u.strip()]
 DEBUG = (os.getenv("DEBUG") or "").lower() == "true"
 STATE_FILE = "state.json"
-SOLD_OUT_MARKERS = ("coming soon", "out of stock", "sold out")
+SOLD_OUT_MARKERS = ("coming soon", "out of stock", "sold out", "currently unavailable")
 ICON = {True: "🟢", False: "🔴", None: "⚪"}
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -111,41 +112,76 @@ def confirm_updates(next_offset):
 
 
 # ---------- parsing ----------
+PRICE = re.compile(r"(?:RS\.?|₹)\s*([\d,]+)", re.I)
+
+
+def combine(a, b):
+    """A 'coming soon'-type marker seen anywhere wins (False); unknown (None) loses."""
+    if a is False or b is False:
+        return False
+    if a is True or b is True:
+        return True
+    return None
+
+
 def merge(found, items):
-    """Merge items into found; a watch counts as available if ANY card says so."""
     for k, p in items.items():
         if k in found:
-            found[k]["available"] = found[k]["available"] or p["available"]
+            found[k]["available"] = combine(found[k]["available"], p["available"])
         else:
             found[k] = p
     return set(items)
 
 
+def image_key(a):
+    img = a.find("img")
+    src = img and (img.get("data-src") or img.get("src"))
+    return (src.rsplit("/", 1)[-1], src) if src else (None, None)
+
+
+def keys_in(node):
+    return {image_key(x)[0] for x in node.select(CARD)} - {None}
+
+
 def parse(html, base_url):
     """Return {image_key: product}. The image filename is the stable identity of a
-    watch, because the product links carry encrypted ids that change on every load."""
+    watch (the product links carry encrypted ids that differ even within one tile)."""
     found = {}
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.select(CARD):
-        img = a.find("img")
-        src = img and (img.get("data-src") or img.get("src"))
-        if not src:
+        key, src = image_key(a)
+        if not key:
             continue
-        key = src.rsplit("/", 1)[-1]
 
+        # Find the whole tile by its images: the biggest ancestor that still holds
+        # only this one watch. (Links can't be used: one tile can have several links
+        # with different encrypted ids.)
         card = a
-        while card.parent is not None and len(
-                {x["href"] for x in card.parent.select(CARD)}) <= 1:
+        while (card.parent is not None and card.parent.name not in ("body", "html")
+               and len(keys_in(card.parent)) <= 1):
             card = card.parent
         text = card.get_text(" ", strip=True)
 
-        m = re.match(r"(.*?)\s*RS\.?\s*([\d,]+)", text, re.I)
-        name = (m.group(1) if m else text[:40]).strip() or key
-        price = m.group(2) if m else "?"
-        available = not any(s in text.lower() for s in SOLD_OUT_MARKERS)
-        merge(found, {key: {"key": key, "name": name, "price": price,
+        m = PRICE.search(text)
+        name = (text[:m.start()] if m else text[:40])
+        for x in SOLD_OUT_MARKERS:  # drop a label that sits in front of the name
+            name = re.sub(re.escape(x), "", name, flags=re.I)
+        name = " ".join(name.split())[:90] or key
+        img = a.find("img")
+        full = ((img.get("alt") if img else "") or a.get("title") or "").strip()
+        if full and name.endswith("..") and full.lower().startswith(name.rstrip(".").lower()):
+            name = full
+
+        low = text.lower()
+        if any(x in low for x in SOLD_OUT_MARKERS):
+            available = False
+        elif m:
+            available = True      # price shown and no "coming soon"-type label
+        else:
+            available = None      # can't tell (not a real product tile?): never alert
+        merge(found, {key: {"key": key, "name": name, "price": m.group(1) if m else "?",
                             "image": urljoin(base_url, src), "link": urljoin(base_url, a["href"]),
-                            "available": available}})
+                            "available": available, "snippet": text[:160]}})
     return found
 
 
@@ -272,9 +308,11 @@ def cmd_products(state, found, counts):
     items = sorted(found.values(), key=lambda p: (p["name"], p["price"]))
     state["listing"] = [{k: p[k] for k in ("key", "name", "price", "image")} for p in items]
     lines = [f"{i}. {ICON[p['available']]} {'📌 ' if p['key'] in state['tracked'] else ''}"
-             f"{p['name']} – ₹{p['price']}" for i, p in enumerate(items, 1)]
-    send("\n".join(lines) + f"\n\n{counts_line(counts)}\nUse /track <numbers> or /track all "
-         "(📌 = already tracked)")
+             f"{p['name']} – ₹{p['price']} [{p['key'].split('.')[0][-4:]}]"
+             for i, p in enumerate(items, 1)]
+    send("\n".join(lines) + f"\n\n{counts_line(counts)}\n"
+         "🔴 coming soon / out of stock · 🟢 no such label found · ⚪ couldn't tell\n"
+         "/track <numbers|all> to track · /why <number> to see what I read · 📌 = tracked")
 
 
 def cmd_track(state, found, args):
@@ -297,8 +335,22 @@ def cmd_track(state, found, args):
         avail = cur["available"] if cur else None
         state["tracked"][p["key"]] = {"name": p["name"], "price": p["price"],
                                       "image": p["image"], "available": avail}
-        added.append(f"{p['name']} – ₹{p['price']}" + ("  (already available!)" if avail else ""))
+        added.append(f"{p['name']} – ₹{p['price']}" + ("  🟢 looks available right now" if avail else ""))
     send("✅ Now tracking:\n" + "\n".join(added) if added else "Nothing new to track.")
+
+
+def cmd_why(state, found, args):
+    listing = state["listing"]
+    if not (args and args[0].isdigit() and 1 <= int(args[0]) <= len(listing)):
+        send("Usage: /why 12   (number from /products)")
+        return
+    item = listing[int(args[0]) - 1]
+    p = found.get(item["key"])
+    if not p:
+        send(f"{item['name']} isn't visible on the site right now.")
+        return
+    send(f"{ICON[p['available']]} {p['name']} – ₹{p['price']}\nimage file: {p['key']}\n"
+         f"Text I read on its tile:\n\"{p['snippet']}\"")
 
 
 def cmd_list(state):
@@ -329,6 +381,8 @@ def handle(text, state, found, counts):
         cmd_products(state, found, counts)
     elif cmd == "/track":
         cmd_track(state, found, args)
+    elif cmd == "/why":
+        cmd_why(state, found, args)
     elif cmd == "/list":
         cmd_list(state)
     elif cmd == "/untrack":
@@ -336,7 +390,7 @@ def handle(text, state, found, counts):
     elif cmd == "/status":
         send(f"✅ Checked just now.\n{counts_line(counts)}\nTracking {len(state['tracked'])} watches.")
     else:
-        send("Commands:\n/products\n/track <numbers|all>\n/list\n/untrack <number|all>\n/status")
+        send("Commands:\n/products\n/track <numbers|all>\n/list\n/untrack <number|all>\n/why <number>\n/status")
 
 
 # ---------- main ----------
@@ -363,10 +417,11 @@ def main():
         p = found.get(key)
         if p is None:
             continue  # not visible right now: unknown, don't alert
-        if p["available"] and t.get("available") is not True:
+        if p["available"] is True and t.get("available") is not True:
             send_photo(p["image"],
                        f"🟢 NO LONGER 'COMING SOON'!\n{p['name']} – ₹{p['price']}\n{p['link']}")
-        t["available"] = p["available"]
+        if p["available"] is not None:
+            t["available"] = p["available"]
 
     save_state(state)
     confirm_updates(next_offset)
